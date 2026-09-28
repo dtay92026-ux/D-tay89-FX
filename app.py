@@ -124,8 +124,6 @@ with st.expander("Configure MT4 / MT5 Server Settings", expanded=False):
 async def fetch_metaapi_account(token, acc_id):
     api = MetaApi(token)
     account = await api.metatrader_account_api.get_account(acc_id)
-    if account.state != 'DEPLOYED':
-        await account.deploy()
     connection = account.get_rpc_connection()
     await connection.connect()
     await connection.wait_synchronized()
@@ -181,8 +179,6 @@ with col_tp:
 async def execute_metaapi_trade(token, acc_id, symbol, action_type, volume):
     api = MetaApi(token)
     account = await api.metatrader_account_api.get_account(acc_id)
-    if account.state != 'DEPLOYED':
-        await account.deploy()
     connection = account.get_rpc_connection()
     await connection.connect()
     await connection.wait_synchronized()
