@@ -1,21 +1,61 @@
 import datetime
-import yfinance as yf
+import threading
+import requests
+import streamlit as st
 import pandas as pd
 import numpy as np
 
-# --- CONFIGURATION ---
-SYMBOL = "GC=F"  # Yahoo Finance ticker for Gold (Use "EURUSD=X" for Euro/USD forex)
-LOT_SIZE = 0.01
-TIMEFRAME = "15m"
-RR_RATIO = 2.0
-MAX_TRADES = 1
-FALLBACK_SL_PCT = 1.5
+# Mobile Viewport & Cyberpunk Page Setup
+st.set_page_config(
+    page_title="D-TAY89 FX ENGINE - OANDA", 
+    page_icon="⚡", 
+    layout="centered", 
+    initial_sidebar_state="collapsed"
+)
 
-def log_msg(msg):
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+# Dark Cyber Neon Styling
+st.markdown("""
+    <style>
+    .stApp { background-color: #08090d; color: #e0e6ed; }
+    .neon-title {
+        text-align: center; font-weight: 900; font-size: 26px; color: #00f3ff;
+        text-shadow: 0 0 15px rgba(0, 243, 255, 0.7); margin-bottom: 2px;
+    }
+    .neon-subtitle {
+        text-align: center; color: #ff0055; font-size: 11px;
+        letter-spacing: 2px; font-weight: bold; text-transform: uppercase; margin-bottom: 15px;
+    }
+    .stTextInput input, .stNumberInput input, div[data-baseweb="select"] {
+        background-color: #121520 !important; color: #00f3ff !important;
+        border: 1px solid #1a2236 !important; border-radius: 8px !important;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #00ff88 !important; font-weight: 800; font-size: 19px !important;
+    }
+    div.stButton > button {
+        width: 100% !important; border-radius: 8px !important; font-weight: 800 !important;
+        font-size: 14px !important; height: 3.2em !important; background-color: #121624 !important;
+        color: #00f3ff !important; border: 1px solid #00f3ff !important;
+    }
+    div.stButton > button:hover { background-color: #00f3ff !important; color: #08090d !important; }
+    </style>
+""", unsafe_allow_html=True)
 
-# --- TECHNICAL INDICATOR FUNCTIONS ---
+# Shared Thread-Safe State
+if "bot_active" not in st.session_state:
+    st.session_state.bot_active = False
+if "logs" not in st.session_state:
+    st.session_state.logs = ["SYSTEM: D-tay89 OANDA Native REST Engine Ready."]
+if "account_info" not in st.session_state:
+    st.session_state.account_info = {"balance": "--", "equity": "--", "margin": "--", "regime": "STANDBY"}
+
+def add_log(msg):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    st.session_state.logs.append(f"[{ts}] {msg}")
+    if len(st.session_state.logs) > 18:
+        st.session_state.logs.pop(0)
+
+# Technical Indicators
 def calculate_ema(closes, period=50):
     k = 2 / (period + 1)
     ema = [closes[0]]
@@ -58,83 +98,232 @@ def calculate_adx(candles, period=14):
 
     return sum(dx_list[-period:]) / period if len(dx_list) >= period else 0.0
 
-# --- MAIN EXECUTION CYCLE ---
-def run_strategy_cycle():
-    log_msg(f"STARTING SCAN CYCLE FOR {SYMBOL}")
+# --- OANDA API HELPER FUNCTIONS ---
+def get_base_url(env_type):
+    if env_type == "Practice (Demo)":
+        return "https://api-fxpractice.oanda.com"
+    return "https://api-fxtrade.oanda.com"
+
+def fetch_oanda_account(token, account_id, env_type):
+    base_url = get_base_url(env_type)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    url = f"{base_url}/v3/accounts/{account_id}/summary"
+    resp = requests.get(url, headers=headers, timeout=10)
+    if resp.status_code == 200:
+        return resp.json().get("account", {})
+    else:
+        raise Exception(f"API Error {resp.status_code}: {resp.text}")
+
+def fetch_oanda_candles(token, account_id, env_type, instrument, granularity="M15", count=60):
+    base_url = get_base_url(env_type)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    url = f"{base_url}/v3/instruments/{instrument}/candles?granularity={granularity}&count={count}&price=M"
+    resp = requests.get(url, headers=headers, timeout=10)
+    if resp.status_code == 200:
+        data = resp.json().get("candles", [])
+        formatted = []
+        for c in data:
+            if c.get("complete", True):
+                mid = c.get("mid", {})
+                formatted.append({
+                    'open': float(mid.get('o', 0)),
+                    'high': float(mid.get('h', 0)),
+                    'low': float(mid.get('l', 0)),
+                    'close': float(mid.get('c', 0))
+                })
+        return formatted
+    return []
+
+def place_oanda_order(token, account_id, env_type, instrument, units, stop_loss=None, take_profit=None):
+    base_url = get_base_url(env_type)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    url = f"{base_url}/v3/accounts/{account_id}/orders"
     
-    try:
-        # Fetch live/historical candle data via yfinance
-        data = yf.download(SYMBOL, period="5d", interval=TIMEFRAME, progress=False)
-        if data.empty:
-            log_msg("ERROR: No data fetched from Yahoo Finance.")
-            return
+    order_data = {
+        "order": {
+            "units": str(units),
+            "instrument": instrument,
+            "timeInForce": "FOK",
+            "type": "MARKET",
+            "positionFill": "DEFAULT"
+        }
+    }
+    if stop_loss:
+        order_data["order"]["stopLossOnFill"] = {"price": f"{stop_loss:.5f}"}
+    if take_profit:
+        order_data["order"]["takeProfitOnFill"] = {"price": f"{take_profit:.5f}"}
 
-        # Flatten multi-index columns if present in newer yfinance versions
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+    resp = requests.post(url, headers=headers, json=order_data, timeout=10)
+    return resp.json()
 
-        candles = []
-        for index, row in data.iterrows():
-            candles.append({
-                'open': float(row['Open']),
-                'high': float(row['High']),
-                'low': float(row['Low']),
-                'close': float(row['Close'])
-            })
+# --- BACKGROUND OANDA LOOP ---
+def run_oanda_ea_loop(api_token, acc_id, env_type, symbol, units, timeframe, rr_ratio, max_trades):
+    granularity_map = {"5m": "M5", "15m": "M15", "1h": "H1", "4h": "H4"}
+    gran = granularity_map.get(timeframe, "M15")
 
-        if len(candles) < 50:
-            log_msg("ERROR: Not enough candles for indicators.")
-            return
+    while st.session_state.get("bot_active", False):
+        try:
+            base_url = get_base_url(env_type)
+            headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
+            trades_resp = requests.get(f"{base_url}/v3/accounts/{acc_id}/openTrades", headers=headers, timeout=10)
+            if trades_resp.status_code == 200:
+                open_trades = trades_resp.json().get("trades", [])
+                symbol_trades = [t for t in open_trades if t.get('instrument') == symbol]
+                if len(symbol_trades) >= max_trades:
+                    import time
+                    time.sleep(10)
+                    continue
 
-        closes = [c['close'] for c in candles]
-        highs = [c['high'] for c in candles]
-        lows = [c['low'] for c in candles]
-        opens = [c['open'] for c in candles]
+            candles = fetch_oanda_candles(api_token, acc_id, env_type, symbol, granularity=gran, count=60)
+            if not candles or len(candles) < 50:
+                import time
+                time.sleep(10)
+                continue
 
-        # Calculate ADX & Market Regime
-        adx_val = calculate_adx(candles, 14)
-        current_price = closes[-1]
-        log_msg(f"Current Price: {current_price:.2f} | ADX (14): {adx_val:.1f}")
+            closes = [c['close'] for c in candles]
+            highs = [c['high'] for c in candles]
+            lows = [c['low'] for c in candles]
+            opens = [c['open'] for c in candles]
 
-        # STRATEGY ROUTING
-        if adx_val >= 25.0:
-            log_msg("Market Regime: TRENDING (ADX >= 25.0)")
-            ema50 = calculate_ema(closes, 50)
-            c1, c2 = closes[-2], closes[-3]
-            e1, e2 = ema50[-2], ema50[-3]
-            h2, h3 = highs[-3], highs[-4]
-            l2, l3 = lows[-3], lows[-4]
+            adx_val = calculate_adx(candles, 14)
+            current_price = closes[-1]
 
-            buy_signal = (c1 > e1 and c2 > e2) and (c1 > h2 and c2 > h3)
-            sell_signal = (c1 < e1 and c2 < e2) and (c1 < l2 and c2 < l3)
+            if adx_val >= 25.0:
+                st.session_state.account_info["regime"] = f"TRENDING (ADX: {adx_val:.1f})"
+                ema50 = calculate_ema(closes, 50)
+                c1, c2 = closes[-2], closes[-3]
+                e1, e2 = ema50[-2], ema50[-3]
+                h2, h3 = highs[-3], highs[-4]
+                l2, l3 = lows[-3], lows[-4]
 
-            if buy_signal:
-                log_msg(f"SIGNAL DETECTED: BUY [TREND] on {SYMBOL}")
-            elif sell_signal:
-                log_msg(f"SIGNAL DETECTED: SELL [TREND] on {SYMBOL}")
+                if (c1 > e1 and c2 > e2) and (c1 > h2 and c2 > h3):
+                    sl = current_price * 0.985
+                    tp = current_price + ((current_price - sl) * rr_ratio)
+                    res = place_oanda_order(api_token, acc_id, env_type, symbol, units, sl, tp)
+                    add_log(f"OANDA BUY [TREND]: {units} {symbol} | Executed")
+                elif (c1 < e1 and c2 < e2) and (c1 < l2 and c2 < l3):
+                    sl = current_price * 1.015
+                    tp = current_price - ((sl - current_price) * rr_ratio)
+                    res = place_oanda_order(api_token, acc_id, env_type, symbol, -units, sl, tp)
+                    add_log(f"OANDA SELL [TREND]: {units} {symbol} | Executed")
+
+            elif adx_val <= 20.0:
+                st.session_state.account_info["regime"] = f"RANGING (ADX: {adx_val:.1f})"
+                range_high = max(highs[-22:-2])
+                range_low = min(lows[-22:-2])
+                c1, o1, h1, l1 = closes[-2], opens[-2], highs[-2], lows[-2]
+
+                if (l1 <= range_low) and (c1 > o1):
+                    sl = current_price * 0.985
+                    tp = current_price + ((current_price - sl) * rr_ratio)
+                    res = place_oanda_order(api_token, acc_id, env_type, symbol, units, sl, tp)
+                    add_log(f"OANDA BUY [RANGE]: {units} {symbol} | Executed")
+                elif (h1 >= range_high) and (c1 < o1):
+                    sl = current_price * 1.015
+                    tp = current_price - ((sl - current_price) * rr_ratio)
+                    res = place_oanda_order(api_token, acc_id, env_type, symbol, -units, sl, tp)
+                    add_log(f"OANDA SELL [RANGE]: {units} {symbol} | Executed")
             else:
-                log_msg("No trend trade setup triggered on this cycle.")
+                st.session_state.account_info["regime"] = f"INDECISIVE (ADX: {adx_val:.1f})"
 
-        elif adx_val <= 20.0:
-            log_msg("Market Regime: RANGING (ADX <= 20.0)")
-            range_high = max(highs[-22:-2])
-            range_low = min(lows[-22:-2])
-            c1, o1, h1, l1 = closes[-2], opens[-2], highs[-2], lows[-2]
+        except Exception as e:
+            add_log(f"LOOP ERROR: {str(e)}")
+        
+        import time
+        time.sleep(10)
 
-            buy_signal = (l1 <= range_low) and (c1 > o1)
-            sell_signal = (h1 >= range_high) and (c1 < o1)
+# --- USER INTERFACE ---
+st.markdown("<div class='neon-title'>⚡ D-TAY89 FX ENGINE</div>", unsafe_allow_html=True)
+st.markdown("<div class='neon-subtitle'>OANDA NATIVE REST API TERMINAL</div>", unsafe_allow_html=True)
 
-            if buy_signal:
-                log_msg(f"SIGNAL DETECTED: BUY [RANGE] on {SYMBOL}")
-            elif sell_signal:
-                log_msg(f"SIGNAL DETECTED: SELL [RANGE] on {SYMBOL}")
-            else:
-                log_msg("No range trade setup triggered on this cycle.")
+col_news, col_stop, col_scan = st.columns(3)
+with col_news:
+    st.button("📰 NEWS", use_container_width=True)
+with col_stop:
+    if st.button("⏹ STOP", use_container_width=True):
+        st.session_state.bot_active = False
+        add_log("ENGINE: Background Loop Terminated.")
+        st.rerun()
+with col_scan:
+    if st.button("📈 SCAN", use_container_width=True):
+        add_log("SCANNER: Manual sweep triggered.")
+
+st.divider()
+
+# OANDA Credentials Config
+st.subheader("🔑 OANDA API Connection")
+with st.expander("Configure API & Account Settings", expanded=True):
+    env_type = st.selectbox("Environment", ["Practice (Demo)", "Live (Real Account)"], index=0)
+    api_token = st.text_input("OANDA Access Token", type="password", key="token_input")
+    acc_id = st.text_input("OANDA Account ID", key="acc_input")
+
+if st.button("⚡ CONNECT & SYNC ACCOUNT", use_container_width=True):
+    if not api_token or not acc_id:
+        st.error("Enter OANDA Token & Account ID.")
+    else:
+        with st.spinner("Connecting to OANDA REST API..."):
+            try:
+                acc = fetch_oanda_account(api_token, acc_id, env_type)
+                st.session_state.account_info.update({
+                    "balance": f"${float(acc.get('balance', 0)):,.2f}",
+                    "equity": f"${float(acc.get('NAV', 0)):,.2f}",
+                    "margin": f"${float(acc.get('marginAvailable', 0)):,.2f}"
+                })
+                add_log(f"CONNECTED: Balance ${float(acc.get('balance', 0)):,.2f}")
+                st.success("Account Synced Successfully!")
+            except Exception as e:
+                add_log(f"SYNC ERROR: {str(e)}")
+                st.error(f"Sync Error: {str(e)}")
+
+st.divider()
+
+# Live Broker Stats Metrics
+st.subheader("📊 Live Broker Stats")
+m1, m2, m3 = st.columns(3)
+with m1:
+    st.metric(label="BALANCE", value=st.session_state.account_info["balance"])
+with m2:
+    st.metric(label="EQUITY", value=st.session_state.account_info["equity"])
+with m3:
+    st.metric(label="REGIME", value=st.session_state.account_info["regime"])
+
+st.divider()
+
+# Strategy Parameters
+st.subheader("⚙️ Strategy Parameters")
+selected_symbol = st.selectbox("Trading Pair", ["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY"], index=0)
+
+col_left, col_right = st.columns(2)
+with col_left:
+    units = st.number_input("Units / Lot Size", min_value=1, max_value=100000, value=100, step=1)
+    timeframe = st.selectbox("Timeframe", ["5m", "15m", "1h", "4h"], index=1)
+with col_right:
+    rr_ratio = st.number_input("Risk:Reward Ratio", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
+    max_trades = st.number_input("Max Trades Allowed", min_value=1, max_value=10, value=1, step=1)
+
+st.divider()
+
+# Automation Control
+st.subheader("🖥 API Automation Loop")
+
+if not st.session_state.bot_active:
+    if st.button("▶ START AUTOMATED API ENGINE", use_container_width=True):
+        if not api_token or not acc_id:
+            st.error("Please enter OANDA Token & Account ID above.")
         else:
-            log_msg(f"Market Regime: INDECISIVE (ADX: {adx_val:.1f})")
+            st.session_state.bot_active = True
+            add_log(f"API ENGINE STARTED: {selected_symbol} [{timeframe}] | Units: {units}")
+            
+            t = threading.Thread(
+                target=run_oanda_ea_loop,
+                args=(api_token, acc_id, env_type, selected_symbol, units, timeframe, rr_ratio, max_trades),
+                daemon=True
+            )
+            t.start()
+            st.rerun()
+else:
+    st.success(f"⚡ API ENGINE ACTIVE: Monitoring {selected_symbol} [{timeframe}]...")
 
-    except Exception as e:
-        log_msg(f"EXECUTION ERROR: {str(e)}")
-
-if __name__ == "__main__":
-    run_strategy_cycle()
+# Live Terminal Log
+terminal_output = "\n".join(st.session_state.logs)
+st.code(terminal_output, language="bash")
