@@ -26,8 +26,8 @@ LOT_SIZE = 0.01
 def send_telegram_message(message):
   """Sends a notification message to your Telegram chat."""
   if (
-      TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_FROM_BOTFATHER"
-      or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID"
+      TELEGRAM_BOT_TOKEN == "8587275413:AAGmSLXFH1HuGrcEyGdKKy6g_yimSZ_A5wY"
+      or TELEGRAM_CHAT_ID == "8558431529"
   ):
     print("Telegram token or Chat ID not configured yet.")
     return
